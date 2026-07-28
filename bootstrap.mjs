@@ -1,5 +1,8 @@
 import { spawn } from 'node:child_process';
-import { generateKeyPairSync, randomBytes } from 'node:crypto';
+import {
+  generateKeyPairSync,
+  randomBytes,
+} from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -28,52 +31,63 @@ function generateJwks() {
   });
 }
 
-mkdirSync(dataDirectory, { recursive: true });
+try {
+  mkdirSync(dataDirectory, { recursive: true });
 
-let jwks = process.env.JWKS_KEY?.trim();
+  let jwks = process.env.JWKS_KEY?.trim();
 
-if (!jwks) {
-  if (existsSync(jwksPath)) {
-    jwks = readFileSync(jwksPath, 'utf8');
-    console.log('JWKS loaded from persistent storage.');
-  } else {
-    jwks = generateJwks();
+  if (!jwks) {
+    if (existsSync(jwksPath)) {
+      jwks = readFileSync(jwksPath, 'utf8');
+      console.log('Persistent JWKS loaded.');
+    } else {
+      jwks = generateJwks();
 
-    writeFileSync(jwksPath, jwks, {
-      encoding: 'utf8',
-      mode: 0o600,
-    });
+      writeFileSync(jwksPath, jwks, {
+        encoding: 'utf8',
+        mode: 0o600,
+      });
 
-    console.log('New persistent JWKS generated.');
+      console.log('New persistent JWKS generated.');
+    }
   }
-}
 
-// Vérifie que la valeur est bien du JSON valide.
-JSON.parse(jwks);
+  // Vérification avant le lancement de LobeHub
+  const parsed = JSON.parse(jwks);
 
-process.env.JWKS_KEY = jwks;
+  if (!Array.isArray(parsed.keys) || parsed.keys.length === 0) {
+    throw new Error('JWKS_KEY does not contain a valid keys array.');
+  }
 
-// Le bootstrap démarre comme root pour pouvoir écrire sur le volume,
-// puis LobeHub tourne avec l’UID non privilégié utilisé officiellement.
-if (typeof process.setgid === 'function' && process.getgid?.() === 0) {
-  process.setgid(1001);
-}
+  process.env.JWKS_KEY = jwks;
 
-if (typeof process.setuid === 'function' && process.getuid?.() === 0) {
-  process.setuid(1001);
-}
+  // LobeHub fonctionne officiellement avec UID/GID 1001.
+  if (process.getgid?.() === 0) {
+    process.setgid(1001);
+  }
 
-const child = spawn('/bin/node', ['/app/startServer.js'], {
-  env: process.env,
-  stdio: 'inherit',
-});
+  if (process.getuid?.() === 0) {
+    process.setuid(1001);
+  }
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, () => {
-    child.kill(signal);
+  const child = spawn('/bin/node', ['/app/startServer.js'], {
+    env: process.env,
+    stdio: 'inherit',
   });
-}
 
-child.on('exit', (code) => {
-  process.exit(code ?? 1);
-});
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => child.kill(signal));
+  }
+
+  child.on('exit', (code, signal) => {
+    if (signal) {
+      console.error(`LobeHub stopped by signal ${signal}`);
+      process.exit(1);
+    }
+
+    process.exit(code ?? 1);
+  });
+} catch (error) {
+  console.error('Bootstrap failed:', error);
+  process.exit(1);
+}
